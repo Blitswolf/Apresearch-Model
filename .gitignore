@@ -1,0 +1,7 @@
+model/
+fingerprints/
+research/
+findings/
+*.json
+__pycache__/
+*.pyc
