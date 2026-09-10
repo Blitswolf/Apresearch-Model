@@ -25,7 +25,16 @@ Modes:
                    latest AP fingerprints (written by apvulnd), rotate the deep-mine set, refine.
 """
 import os, re, sys, csv, json, math, time, glob
+import multiprocessing as mp
 from collections import defaultdict, Counter
+
+# Resource budget: parallelise ranking across spare cores (workers fork after the index is loaded,
+# sharing it copy-on-write). Override with APRESEARCH_WORKERS.
+try:
+    WORKERS = int(os.environ.get("APRESEARCH_WORKERS", "0")) or (os.cpu_count() or 1)
+except Exception:
+    WORKERS = os.cpu_count() or 1
+_MP_INDEX = None
 
 EDB_DIR   = "/usr/share/exploitdb"
 CSV_PATH  = EDB_DIR + "/files_exploits.csv"
@@ -119,18 +128,44 @@ def query_vector(terms, idf):
     return v, norm
 
 
-def rank(index, terms, topk=25):
-    qv, qn = query_vector(terms, index["idf"])
-    if not qv:
-        return []
-    scored = []
-    for i, vec in enumerate(index["vectors"]):
-        dv = vec["v"]
-        # iterate the smaller vector
+def _score_slice(args):
+    lo, hi, qv, qn = args
+    vecs = _MP_INDEX["vectors"]
+    out = []
+    for i in range(lo, hi):
+        dv = vecs[i]["v"]
         small, big = (qv, dv) if len(qv) < len(dv) else (dv, qv)
         dot = sum(w * big.get(t, 0.0) for t, w in small.items())
         if dot > 0:
-            scored.append((dot / (qn * vec["norm"]), i))
+            out.append((dot / (qn * vecs[i]["norm"]), i))
+    return out
+
+
+def rank(index, terms, topk=25, workers=None):
+    qv, qn = query_vector(terms, index["idf"])
+    if not qv:
+        return []
+    N = len(index["vectors"])
+    w = workers or WORKERS
+    if w <= 1 or N < 4000:
+        scored = []
+        for i, vec in enumerate(index["vectors"]):
+            dv = vec["v"]
+            small, big = (qv, dv) if len(qv) < len(dv) else (dv, qv)
+            dot = sum(x * big.get(t, 0.0) for t, x in small.items())
+            if dot > 0:
+                scored.append((dot / (qn * vec["norm"]), i))
+    else:
+        global _MP_INDEX
+        _MP_INDEX = index
+        step = (N + w - 1) // w
+        tasks = [(lo, min(lo + step, N), qv, qn) for lo in range(0, N, step)]
+        try:
+            with mp.Pool(w) as pool:
+                parts = pool.map(_score_slice, tasks)
+            scored = [t for part in parts for t in part]
+        except Exception:
+            scored = _score_slice((0, N, qv, qn))
     scored.sort(reverse=True)
     return [(s, index["docs"][i]) for s, i in scored[:topk]]
 
